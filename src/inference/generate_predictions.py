@@ -34,6 +34,11 @@ from src.data.data_utils import preprocess_df, sample_df
 os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
 
 def generate_predictions(config):
+    iteration = config.iteration
+
+    torch.manual_seed(iteration)
+    np.random.seed(iteration)
+
     # Load in preprocessed MEDS data
     new_meds_dir = Path(config['target_dir']) / f"{config['downstream_task']}_MEDS"
     train_files = sorted((new_meds_dir / "data" / "train").glob("*.parquet"))
@@ -97,7 +102,13 @@ def generate_predictions(config):
     
     model_name = config['model_id']
     predictions_dir = Path(config['predictions_dir'])
-    if os.path.exists(predictions_dir / f'predictions_{config["downstream_task"]}_{config['model_id'].split("/")[-1]}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}.pkl'):
+    predictions_dir.mkdir(parents=True, exist_ok=True)
+
+    if iteration > 0:
+        predictions_file = predictions_dir / f'predictions_{config["downstream_task"]}_{config['model_id'].split("/")[-1]}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}_iter={iteration}.pkl'
+    else:
+        predictions_file = predictions_dir / f'predictions_{config["downstream_task"]}_{config['model_id'].split("/")[-1]}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}.pkl'
+    if os.path.exists(predictions_file):
         print(model_name, "ALREADY RUN")
         return True
 
@@ -190,7 +201,7 @@ def generate_predictions(config):
         
         # Harmony stop tokens (pass to sampler so they won't be included in output)
         stop_token_ids = encoding.stop_tokens_for_assistant_actions()
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=4000, stop_token_ids=stop_token_ids)
+        sampling_params = SamplingParams(temperature=0.0 if iteration == 0 else 0.1, max_tokens=4000, stop_token_ids=stop_token_ids, seed = iteration)
 
         # Initialize the vLLM engine
         llm = LLM(model=model_name, max_model_len=6000, tensor_parallel_size = 2)
@@ -201,25 +212,14 @@ def generate_predictions(config):
             )
 
     elif model_name.startswith("Qwen/"):
-        if config['use_finetuned']:
-            if config['finetune_method'] == 'grpo':
-                adapter_dir = f"{model_name}-GRPO/checkpoint-500" 
-            elif config['finetune_method'] == 'dpo':
-                adapter_dir = f"{model_name}-DPO/checkpoint-1455" 
-            tokenizer = AutoTokenizer.from_pretrained(adapter_dir, padding_side="left")
-            llm = LLM(model=model_name, 
-                      max_model_len=6000,
-                      enable_lora=True
-                      )
-        else:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left") 
-            llm = LLM(
-                model=model_name,
-                max_model_len=6000,
-                tensor_parallel_size = 2
-            )
+        tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left") 
+        llm = LLM(
+            model=model_name,
+            max_model_len=6000,
+            tensor_parallel_size = 2
+        )
         
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=4000)
+        sampling_params = SamplingParams(temperature=0.0 if iteration == 0 else 0.1, max_tokens=4000, seed = iteration)
 
         messages = [
             {"role": "user", "content": prompt} for prompt in input_texts
@@ -234,13 +234,7 @@ def generate_predictions(config):
             for message in messages
         ]
 
-        if config['use_finetuned']:
-            if config['finetune_method'] == 'grpo':
-                outputs = llm.generate(texts, sampling_params, lora_request=LoRARequest("grpo_adapter", 1, adapter_dir))
-            elif config['finetune_method'] == 'dpo':
-                outputs = llm.generate(texts, sampling_params, lora_request=LoRARequest("dpo_adapter", 1, adapter_dir))
-        else:
-            outputs = llm.generate(texts, sampling_params)
+        outputs = llm.generate(texts, sampling_params)
     
     else:
         if model_name.startswith("mistralai/"):
@@ -284,7 +278,7 @@ def generate_predictions(config):
                 for message in messages
             ]
         
-        sampling_params = SamplingParams(temperature=0.0, max_tokens=4000)
+        sampling_params = SamplingParams(temperature=0.0 if iteration == 0 else 0.1, max_tokens=4000, seed = iteration)
 
         if model_name.startswith("mistralai/"):
             outputs = llm.chat(messages=messages, sampling_params=sampling_params)
@@ -301,21 +295,7 @@ def generate_predictions(config):
         subject_dicts[subject_id]["response"] = output_text
         subject_dicts[subject_id]["prediction"] = pred
 
-    # Save predictions as pickle file
-    predictions_dir = Path(config['predictions_dir'])
-    predictions_dir.mkdir(parents=True, exist_ok=True)
-    model_name = config['model_id'].split("/")[-1]
-
-    if config['use_finetuned']:
-        if config['finetune_method'] == 'grpo':
-            predictions_path = predictions_dir / f'predictions_{config["downstream_task"]}_{model_name}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}_{config["use_finetuned"]}_grpo.pkl'
-        elif config['finetune_method'] == 'dpo':
-            predictions_path = predictions_dir / f'predictions_{config["downstream_task"]}_{model_name}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}_{config["use_finetuned"]}_dpo.pkl'
-    else:
-        #predictions_path = predictions_dir / f'predictions_{config["downstream_task"]}_{model_name}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}_{config["use_finetuned"]}.pkl'
-        predictions_path = predictions_dir / f'predictions_{config["downstream_task"]}_{model_name}_{config["explicit_missingness"]}_{config["labs_only"]}_{config["include_cot_prompt"]}.pkl'
-
-    with open(predictions_path, 'wb') as f:
+    with open(predictions_file, 'wb') as f:
         pickle.dump(subject_dicts, f)
 
 def generate_baseline_predictions(config):
